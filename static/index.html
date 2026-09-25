@@ -1,6 +1,46 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>个人数据权利请求</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#263842}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d4dde2;padding:7px}th{background:#eef5f5}.card{background:#eef8f7;border-left:5px solid #2d827b;padding:12px 16px}code{background:#edf1f2;padding:2px 5px}.overdue{color:#a11b1b;font-weight:600}</style>
-<h1>个人数据权利请求处理</h1><div class="card">请求和位置按角色过滤。页面不展示联系方式明文。写接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。</div>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>个人数据权利请求 · 数据出境审查</title>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1280px;margin:28px auto;padding:0 20px;color:#263842}
+table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d4dde2;padding:7px;vertical-align:top}
+th{background:#eef5f5}.card{background:#eef8f7;border-left:5px solid #2d827b;padding:12px 16px}
+code{background:#edf1f2;padding:2px 5px}.overdue{color:#a11b1b;font-weight:600}
+.ok{color:#1c6b40;font-weight:600}.blocked{color:#a11b1b;font-weight:600}.inactive{color:#7a6a12;font-weight:600}
+.gap{display:inline-block;background:#fdecec;border:1px solid #e3b3b3;color:#a11b1b;border-radius:4px;padding:1px 7px;margin:2px 4px 2px 0;font-size:13px}
+.send-closed{background:#fdecec;border-left:5px solid #a11b1b;padding:10px 16px;margin:8px 0}
+.send-open{background:#eaf7ef;border-left:5px solid #1c6b40;padding:10px 16px;margin:8px 0}
+</style>
+<h1>个人数据权利请求处理</h1>
+<div class="card">请求和位置按角色过滤，页面不展示联系方式明文。写接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。</div>
 <h2>处理队列</h2><table id="requests"><thead><tr><th>请求号</th><th>类型</th><th>地区</th><th>状态</th><th>到期日</th><th>处理人</th></tr></thead><tbody></tbody></table>
-<h2>数据定位</h2><table id="locations"><thead><tr><th>请求</th><th>系统</th><th>类别</th><th>状态</th><th>法律保留</th></tr></thead><tbody></tbody></table>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#requests tbody').innerHTML=d.requests.map(r=>`<tr class="${r.overdue?'overdue':''}"><td>${r.request_no}</td><td>${r.request_type}</td><td>${r.jurisdiction}</td><td>${r.status}</td><td>${r.due_date}</td><td>${r.assigned_to||''}</td></tr>`).join('');document.querySelector('#locations tbody').innerHTML=d.locations.map(r=>`<tr><td>${r.request_id}</td><td>${r.system_name}</td><td>${r.data_category}</td><td>${r.status}</td><td>${r.legal_hold?'是':'否'}</td></tr>`).join('')}load()</script></html>
+<h2>数据定位与出境目的地</h2><table id="locations"><thead><tr><th>请求</th><th>系统</th><th>类别</th><th>定位状态</th><th>法律保留</th><th>目的地</th><th>境外接收方</th></tr></thead><tbody></tbody></table>
+<h2>出境目的地登记</h2><table id="destinations"><thead><tr><th>代码</th><th>名称</th><th>国家/地区</th><th>风险等级</th><th>高风险文件要求</th></tr></thead><tbody></tbody></table>
+<h2>数据出境审查（每个目的地/接收方仅一份有效审查）</h2><table id="reviews"><thead><tr><th>审查号</th><th>请求</th><th>目的地</th><th>接收方</th><th>标准合同号</th><th>影响评估号</th><th>状态</th><th>发送入口 / 缺口</th><th>停用原因</th></tr></thead><tbody></tbody></table>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function reviewRow(r){
+  const cls=r.status==='approved'?'ok':r.status==='blocked'?'blocked':'inactive';
+  const label=r.status==='approved'?'通过':r.status==='blocked'?'阻断（入口关闭）':'已停用（历史依据可查）';
+  const gaps=(r.gap_messages||[]).map(g=>`<span class="gap">${esc(g)}</span>`).join('');
+  const entry=r.status==='approved'
+    ? '<span class="ok">发送入口开启</span>'
+    : `<span class="${r.status==='blocked'?'blocked':'inactive'}">发送入口关闭</span>${gaps}`;
+  return `<tr><td>${esc(r.review_no)}</td><td>${r.request_id}</td><td>${esc(r.destination_code)}</td>
+  <td>${esc(r.recipient)}</td><td>${esc(r.standard_contract_no||'—')}</td><td>${esc(r.impact_assessment_no||'—')}</td>
+  <td class="${cls}">${label}</td><td>${entry}</td><td>${esc(r.deactivated_reason||'')}</td></tr>`;
+}
+async function load(){
+  const d=await fetch('/api/state').then(r=>r.json());
+  document.querySelector('#requests tbody').innerHTML=d.requests.map(r=>`<tr class="${r.overdue?'overdue':''}"><td>${esc(r.request_no)}</td><td>${esc(r.request_type)}</td><td>${esc(r.jurisdiction)}</td><td>${esc(r.status)}</td><td>${esc(r.due_date)}</td><td>${esc(r.assigned_to||'')}</td></tr>`).join('');
+  document.querySelector('#locations tbody').innerHTML=d.locations.map(r=>`<tr><td>${r.request_id}</td><td>${esc(r.system_name)}</td><td>${esc(r.data_category)}</td><td>${esc(r.status)}</td><td>${r.legal_hold?'<span class="blocked">是</span>':'否'}</td><td>${esc(r.destination_code||'<span class=gap>未登记目的地</span>')}</td><td>${esc(r.recipient||'—')}</td></tr>`).join('');
+  document.querySelector('#destinations tbody').innerHTML=(d.export_destinations||[]).map(x=>`<tr><td>${esc(x.code)}</td><td>${esc(x.name)}</td><td>${esc(x.country)}</td><td class="${x.risk_level==='high'?'blocked':'ok'}">${x.risk_level==='high'?'高风险':'标准'}</td><td>${x.risk_level==='high'?'必须附标准合同号 + 影响评估号':'—'}</td></tr>`).join('')||'<tr><td colspan=5>暂无目的地登记</td></tr>';
+  const reviews=d.export_reviews||[];
+  document.querySelector('#reviews tbody').innerHTML=reviews.map(reviewRow).join('')||'<tr><td colspan=9>暂无出境审查</td></tr>';
+  const closed=reviews.some(r=>r.status!=='approved');
+  const unregistered=d.locations.filter(l=>!l.destination_code).length;
+  const banner=(!reviews.length||closed||unregistered)
+    ? `<div class="send-closed">发送入口关闭：${closed?'存在阻断或已停用的审查；':''}${unregistered?unregistered+' 条数据位置未登记目的地/接收方；':''}${!reviews.length?'尚无任何出境审查；':''}缺口见各行红色标签。</div>`
+    : '<div class="send-open">全部目的地审查通过，发送入口开启。撤回同意或出现法律保留后将自动停用/阻断。</div>';
+  document.querySelector('#reviews').insertAdjacentHTML('beforebegin',banner);
+}
+load();
+</script></html>
