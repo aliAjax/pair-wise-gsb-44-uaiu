@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from export_review import ExportReviewStore, evaluate_send_gate
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "privacy_requests.db"
 REQUEST_TYPES = {"access", "correction", "deletion", "withdraw_consent", "restriction"}
@@ -56,8 +58,10 @@ def sha256_text(value: str) -> str:
 
 
 class PrivacyRequestService:
-    def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB):
+    def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB,
+                 high_risk_destinations: set[str] | None = None):
         self.db_path = str(db_path)
+        self.export_store = ExportReviewStore(high_risk_destinations)
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
@@ -87,6 +91,7 @@ class PrivacyRequestService:
                     region TEXT NOT NULL,
                     is_minor INTEGER NOT NULL DEFAULT 0,
                     contact_hash TEXT NOT NULL,
+                    consent_withdrawn_at TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS requests (
@@ -142,6 +147,10 @@ class PrivacyRequestService:
                 CREATE INDEX IF NOT EXISTS idx_requests_subject ON requests(subject_id,request_type,submitted_at);
                 """
             )
+            conn.executescript(self.export_store.schema())
+            subject_cols = {row["name"] for row in conn.execute("PRAGMA table_info(data_subjects)")}
+            if "consent_withdrawn_at" not in subject_cols:
+                conn.execute("ALTER TABLE data_subjects ADD COLUMN consent_withdrawn_at TEXT")
 
     def _audit(self, conn: sqlite3.Connection, request_id: int | None, actor: str,
                action: str, details: dict[str, Any]) -> None:
@@ -454,6 +463,115 @@ class PrivacyRequestService:
             self._audit(conn, request_id, actor, "request.rejected", {"reason": reason.strip()})
             return dict(self._request(conn, request_id))
 
+    def _export_gate(self, conn: sqlite3.Connection, review: sqlite3.Row) -> dict[str, Any]:
+        location = conn.execute("SELECT * FROM data_locations WHERE id=?", (review["location_id"],)).fetchone()
+        subject = conn.execute("SELECT * FROM data_subjects WHERE id=?", (review["subject_id"],)).fetchone()
+        return evaluate_send_gate(location, subject, review)
+
+    def _export_view(self, conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["gate"] = self._export_gate(conn, row)
+            result.append(item)
+        return result
+
+    def submit_export_review(self, actor: str, role: str, location_id: int, destination: str,
+                             recipient: str, standard_contract_no: str = "",
+                             impact_assessment_no: str = "", guardian_consent_ref: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"privacy_officer", "supervisor"}, "登记出境审查")
+        destination, recipient = (destination or "").strip().upper(), (recipient or "").strip()
+        if not destination or not recipient:
+            raise DomainError("出境目的地和接收方不能为空")
+        try:
+            location_id = int(location_id)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("数据位置编号无效") from exc
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            location = conn.execute("SELECT * FROM data_locations WHERE id=?", (location_id,)).fetchone()
+            if not location:
+                raise DomainError("数据位置不存在", 404)
+            req = self._request(conn, location["request_id"])
+            self._can_process(actor, role, req, "登记出境审查")
+            existing = self.export_store.active_review(conn, location_id, destination)
+            if existing:
+                if existing["sent_at"]:
+                    raise DomainError("该目的地审查已完成发送，不能重复提交", 409)
+                review = self.export_store.update_active(
+                    conn, existing["id"], recipient=recipient, standard_contract_no=standard_contract_no,
+                    impact_assessment_no=impact_assessment_no, guardian_consent_ref=guardian_consent_ref,
+                )
+                self._audit(conn, req["id"], actor, "export_review.resubmitted",
+                            {"review_no": review["review_no"], "destination": destination})
+                return {"reused": True, "review": dict(review), "gate": self._export_gate(conn, review)}
+            if req["status"] not in {"processing", "extended"}:
+                raise DomainError("请求当前不能登记出境审查", 409)
+            review = self.export_store.insert(
+                conn, location_id=location["id"], request_id=req["id"], subject_id=req["subject_id"],
+                destination=destination, recipient=recipient,
+                high_risk=self.export_store.is_high_risk(destination),
+                standard_contract_no=standard_contract_no, impact_assessment_no=impact_assessment_no,
+                guardian_consent_ref=guardian_consent_ref, created_by=actor, now=utcnow(),
+            )
+            self._audit(conn, req["id"], actor, "export_review.submitted",
+                        {"review_no": review["review_no"], "destination": destination,
+                         "recipient": recipient, "high_risk": bool(review["high_risk"])})
+            return {"reused": False, "review": dict(review), "gate": self._export_gate(conn, review)}
+
+    def send_export(self, actor: str, role: str, review_id: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"privacy_officer", "supervisor"}, "发送出境数据")
+        try:
+            review_id = int(review_id)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("出境审查编号无效") from exc
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            review = self.export_store.get(conn, review_id)
+            if not review:
+                raise DomainError("出境审查不存在", 404)
+            req = self._request(conn, review["request_id"])
+            self._can_process(actor, role, req, "发送出境数据")
+            if review["sent_at"]:
+                raise DomainError("该审查已完成发送", 409)
+            gate = self._export_gate(conn, review)
+            if not gate["sendable"]:
+                raise DomainError("发送入口已关闭：" + "；".join(gate["gaps"]), 409)
+            review = self.export_store.mark_sent(conn, review["id"], utcnow())
+            self._audit(conn, req["id"], actor, "export.sent",
+                        {"review_no": review["review_no"], "destination": review["destination"],
+                         "recipient": review["recipient"]})
+            return {"review": dict(review), "gate": gate}
+
+    def withdraw_subject_consent(self, actor: str, role: str, subject_id: int, reason: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"privacy_officer", "supervisor"}, "记录同意撤回")
+        try:
+            subject_id = int(subject_id)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("数据主体编号无效") from exc
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            subject = conn.execute("SELECT * FROM data_subjects WHERE id=?", (subject_id,)).fetchone()
+            if not subject:
+                raise DomainError("数据主体不存在", 404)
+            if subject["consent_withdrawn_at"]:
+                raise DomainError("该主体的同意已经撤回", 409)
+            now = utcnow()
+            conn.execute("UPDATE data_subjects SET consent_withdrawn_at=? WHERE id=?", (now, subject_id))
+            note = "撤回同意" + ("：" + reason.strip() if reason.strip() else "")
+            deactivated = self.export_store.deactivate_for_subject(conn, subject_id, note, now)
+            for row in deactivated:
+                self._audit(conn, row["request_id"], actor, "export_review.deactivated",
+                            {"review_no": row["review_no"], "destination": row["destination"]})
+            self._audit(conn, None, actor, "consent.withdrawn",
+                        {"subject_id": subject_id, "deactivated_reviews": len(deactivated)})
+            return {"subject_id": subject_id, "consent_withdrawn_at": now,
+                    "deactivated_reviews": [{"review_no": r["review_no"], "destination": r["destination"]}
+                                            for r in deactivated]}
+
     def _visibility(self, actor: str, role: str, conn: sqlite3.Connection) -> list[sqlite3.Row]:
         if role in {"supervisor", "auditor"}:
             return conn.execute("SELECT * FROM requests ORDER BY due_date,id").fetchall()
@@ -477,7 +595,8 @@ class PrivacyRequestService:
                 raise DomainError("无权查看该权利请求", 403)
             locations = [dict(r) for r in conn.execute("SELECT * FROM data_locations WHERE request_id=? ORDER BY id", (request_id,)).fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline WHERE request_id=? ORDER BY id", (request_id,)).fetchall()]
-            return {"request": dict(req), "locations": locations, "timeline": timeline}
+            export_reviews = self._export_view(conn, self.export_store.for_request(conn, request_id))
+            return {"request": dict(req), "locations": locations, "timeline": timeline, "export_reviews": export_reviews}
 
     def queue(self, actor: str, role: str) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -502,7 +621,9 @@ class PrivacyRequestService:
                 locations.extend(dict(r) for r in conn.execute("SELECT * FROM data_locations WHERE request_id=? ORDER BY id", (row["id"],)).fetchall())
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 300").fetchall()]
             jurisdictions = [dict(r) for r in conn.execute("SELECT * FROM jurisdictions ORDER BY code").fetchall()]
-        return {"requests": requests, "locations": locations, "timeline": timeline, "jurisdictions": jurisdictions, "access_limited": not bool(requests)}
+            export_reviews = self._export_view(conn, self.export_store.for_requests(conn, [r["id"] for r in requests]))
+        return {"requests": requests, "locations": locations, "timeline": timeline, "jurisdictions": jurisdictions,
+                "export_reviews": export_reviews, "access_limited": not bool(requests)}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -511,7 +632,14 @@ class PrivacyRequestService:
         self.configure_jurisdiction("sup-demo", "supervisor", "CN", "中国", 30, 30, True, True)
         subject = self.create_subject("intake-demo", "intake", "SUBJ-DEMO-001", "CN", False, "demo@example.test")
         req = self.create_request("intake-demo", "intake", "PR-DEMO-001", subject["id"], "access", "demo-idem-001")
-        return {"seeded": True, "request_id": req["request"]["id"], "subject_id": subject["id"]}
+        request = req["request"]
+        request = self.verify_identity("officer-demo", "privacy_officer", request["id"], request["version"], "ID-DEMO")
+        request = self.assign_request("sup-demo", "supervisor", request["id"], "officer-demo", request["version"])
+        location = self.add_data_location("officer-demo", "privacy_officer", request["id"], "CRM", "profile", "customer")
+        self.classify_location("officer-demo", "privacy_officer", location["id"], False, False, False)
+        review = self.submit_export_review("officer-demo", "privacy_officer", location["id"], "US", "Demo Analytics Inc.")
+        return {"seeded": True, "request_id": request["id"], "subject_id": subject["id"],
+                "review_no": review["review"]["review_no"]}
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -594,6 +722,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.fulfill_request(actor, role, **data)
             elif path == "/api/requests/reject":
                 result = self.service.reject_request(actor, role, **data)
+            elif path == "/api/export-reviews":
+                result = self.service.submit_export_review(actor, role, **data)
+            elif path == "/api/export/send":
+                result = self.service.send_export(actor, role, **data)
+            elif path == "/api/subjects/withdraw-consent":
+                result = self.service.withdraw_subject_consent(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
